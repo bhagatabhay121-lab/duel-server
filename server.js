@@ -21,7 +21,7 @@ const { WebSocketServer } = require('ws');
 const PORT = Number(process.env.PORT || 8080);
 const REQUIRE_AUTH = process.env.REQUIRE_AUTH === '1';
 const COUNTDOWN_MS = 3000;
-const ROOM_WAIT_MS = 120000;
+const ROOM_WAIT_MS = Number(process.env.ROOM_WAIT_MS || 120000);
 
 // ---- Firebase token verification --------------------------------------------
 // Key can come from (1) FIREBASE_SERVICE_ACCOUNT_JSON: the whole JSON text in an
@@ -91,7 +91,10 @@ class Room {
     this.players = [];       // sockets, index = slot
     this.state = 'wait';     // wait | count | live | done
     this.timers = [];
-    if (isPrivate) this.timers.push(setTimeout(() => this.destroy('expired'), ROOM_WAIT_MS));
+    // Only while waiting for the guest. Cleared in begin(), otherwise it would
+    // kill a live friend match 2 minutes after the room was created.
+    this.waitTimer = isPrivate ? setTimeout(() => { if (this.state === 'wait') this.destroy('expired'); }, ROOM_WAIT_MS) : null;
+    if (this.waitTimer) this.timers.push(this.waitTimer);
   }
   add(ws) {
     this.players.push(ws);
@@ -99,6 +102,7 @@ class Room {
     ws.slot = this.players.length - 1;
   }
   begin() {
+    if (this.waitTimer) { clearTimeout(this.waitTimer); this.waitTimer = null; }
     this.state = 'count';
     this.players.forEach((p, i) => {
       const o = this.players[1 - i];
@@ -115,7 +119,8 @@ class Room {
   end(winner, reason) {
     if (this.state === 'done') return;
     this.state = 'done';
-    this.players.forEach((p) => send(p, { t: 'end', winner, reason }));
+    // `won` is explicit so a phone never has to work out its own result.
+    this.players.forEach((p, i) => send(p, { t: 'end', winner, reason, won: i === winner }));
     this.destroy(null);
   }
   destroy(notify) {
