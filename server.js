@@ -23,19 +23,28 @@ const REQUIRE_AUTH = process.env.REQUIRE_AUTH === '1';
 const COUNTDOWN_MS = 3000;
 const ROOM_WAIT_MS = 120000;
 
-// ---- optional Firebase token verification ---------------------------------
+// ---- Firebase token verification --------------------------------------------
 let adminAuth = null;
-try {
-  const admin = require('firebase-admin');
-  const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (sa) {
-    admin.initializeApp({ credential: admin.credential.cert(require(require('path').resolve(sa))) });
+const saPath = process.env.FIREBASE_SERVICE_ACCOUNT;
+if (saPath || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  try {
+    const admin = require('firebase-admin');
+    if (saPath) {
+      const fs = require('fs');
+      const path = require('path');
+      const full = path.resolve(saPath);
+      if (!fs.existsSync(full)) throw new Error('key file not found at ' + full);
+      admin.initializeApp({ credential: admin.credential.cert(JSON.parse(fs.readFileSync(full, 'utf8'))) });
+    } else {
+      admin.initializeApp();
+    }
     adminAuth = admin.auth();
-  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    admin.initializeApp();
-    adminAuth = admin.auth();
+  } catch (e) {
+    console.error('Firebase auth setup FAILED: ' + e.message);
   }
-} catch (_) { /* firebase-admin not installed: dev mode */ }
+} else {
+  console.log('FIREBASE_SERVICE_ACCOUNT is not set.');
+}
 
 if (REQUIRE_AUTH && !adminAuth) {
   console.error('REQUIRE_AUTH=1 but firebase-admin is not configured. Exiting.');
