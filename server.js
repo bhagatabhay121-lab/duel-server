@@ -24,26 +24,42 @@ const COUNTDOWN_MS = 3000;
 const ROOM_WAIT_MS = 120000;
 
 // ---- Firebase token verification --------------------------------------------
+// Key can come from (1) FIREBASE_SERVICE_ACCOUNT_JSON: the whole JSON text in an
+// environment variable, or (2) FIREBASE_SERVICE_ACCOUNT: path to the JSON file.
 let adminAuth = null;
-const saPath = process.env.FIREBASE_SERVICE_ACCOUNT;
-if (saPath || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+{
+  const fs = require('fs');
+  const path = require('path');
+  const jsonEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const saPath = process.env.FIREBASE_SERVICE_ACCOUNT;
+  let cred = null;
   try {
-    const admin = require('firebase-admin');
-    if (saPath) {
-      const fs = require('fs');
-      const path = require('path');
-      const full = path.resolve(saPath);
-      if (!fs.existsSync(full)) throw new Error('key file not found at ' + full);
-      admin.initializeApp({ credential: admin.credential.cert(JSON.parse(fs.readFileSync(full, 'utf8'))) });
-    } else {
-      admin.initializeApp();
+    if (jsonEnv) {
+      cred = JSON.parse(jsonEnv);
+      console.log('Firebase key: read from FIREBASE_SERVICE_ACCOUNT_JSON');
+    } else if (saPath) {
+      const tries = [saPath, path.join('/etc/secrets', path.basename(saPath)),
+                     path.join(process.cwd(), path.basename(saPath))];
+      const found = tries.find((f) => fs.existsSync(f));
+      if (!found) {
+        let listing = '';
+        try { listing = ' /etc/secrets contains: [' + fs.readdirSync('/etc/secrets').join(', ') + ']'; }
+        catch { listing = ' (/etc/secrets does not exist: no Secret File was created)'; }
+        throw new Error('key file not found. Looked in: ' + tries.join(', ') + '.' + listing);
+      }
+      cred = JSON.parse(fs.readFileSync(found, 'utf8'));
+      console.log('Firebase key: read from ' + found);
+    } else if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      console.log('No Firebase key configured (set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT).');
     }
-    adminAuth = admin.auth();
+    if (cred || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      const admin = require('firebase-admin');
+      admin.initializeApp(cred ? { credential: admin.credential.cert(cred) } : undefined);
+      adminAuth = admin.auth();
+    }
   } catch (e) {
     console.error('Firebase auth setup FAILED: ' + e.message);
   }
-} else {
-  console.log('FIREBASE_SERVICE_ACCOUNT is not set.');
 }
 
 if (REQUIRE_AUTH && !adminAuth) {
