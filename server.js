@@ -17,6 +17,9 @@
  *   CRASH_DIR                 where crash logs from the game are stored
  *                             (default ./crash_logs)
  *   TRUST_PROXY=1             use X-Forwarded-For for rate limiting (behind a proxy)
+ *   CRASH_VIEW_KEY            secret that unlocks the log viewer (unset = viewer off):
+ *                               GET /crash/list?key=SECRET
+ *                               GET /crash/files/<name>?key=SECRET
  *
  * Besides the duel relay this server has POST /crash: the game uploads its
  * flight-recorder log there after a crash. One JSON file per upload is written
@@ -25,6 +28,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT || 8080);
@@ -135,9 +139,45 @@ function handleCrash(req, res) {
       if (err) return reply(500, { ok: false });
       pruneCrashDir();
       console.log(`crash log stored: ${name} (${lines.length} lines)`);
+      // Render's free disk is wiped on restart, so also print the end of the log
+      // (the part that matters) into the service logs, which Render keeps.
+      console.log(`--- last lines of ${name} ---\n${lines.slice(-40).join('\n')}\n--- end ${name} ---`);
       reply(200, { ok: true });
     });
   });
+}
+
+const VIEW_KEY = process.env.CRASH_VIEW_KEY || '';
+function keyOk(k) {
+  if (!VIEW_KEY || typeof k !== 'string') return false;
+  const a = crypto.createHash('sha256').update(k).digest();
+  const b = crypto.createHash('sha256').update(VIEW_KEY).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Read-only viewer, off unless CRASH_VIEW_KEY is set.
+function handleCrashView(req, res, url) {
+  const send = (code, type, body) => { res.writeHead(code, { 'content-type': type }); res.end(body); };
+  const ip = (TRUST_PROXY ? String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() : '') || req.socket.remoteAddress || 'unknown';
+  if (!keyOk(url.searchParams.get('key'))) {
+    crashAllowed(ip);                                   // wrong guesses use up the hourly allowance
+    return send(404, 'text/plain', 'not found');
+  }
+  let files = [];
+  try { files = fs.readdirSync(CRASH_DIR).filter((f) => f.endsWith('.json')).sort().reverse(); } catch (_) {}
+  const key = encodeURIComponent(VIEW_KEY);
+  if (url.pathname === '/crash/list') {
+    const rows = files.map((f) => `<li><a href="/crash/files/${f}?key=${key}">${f}</a></li>`).join('');
+    return send(200, 'text/html; charset=utf-8',
+      `<!doctype html><meta name=viewport content="width=device-width"><title>Crash logs</title><h3>Crash logs (${files.length}), newest first</h3><ul>${rows || '<li>none stored (disk is cleared on restart: see the service logs)</li>'}</ul>`);
+  }
+  const m = /^\/crash\/files\/([A-Za-z0-9_-]+\.json)$/.exec(url.pathname);
+  if (!m || !files.includes(m[1])) return send(404, 'text/plain', 'not found');
+  try {
+    const rec = JSON.parse(fs.readFileSync(path.join(CRASH_DIR, m[1]), 'utf8'));
+    const head = `kind=${rec.kind} app=${rec.app} received=${rec.receivedAt} os=${rec.os} cpus=${rec.cpus}\n\n`;
+    return send(200, 'text/plain; charset=utf-8', head + rec.lines.join('\n'));
+  } catch (_) { return send(500, 'text/plain', 'unreadable'); }
 }
 
 // ---- state -------------------------------------------------------------------
@@ -299,6 +339,10 @@ async function onMessage(ws, raw) {
 // ---- boot ----------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/crash') { handleCrash(req, res); return; }
+  if (req.method === 'GET' && req.url.startsWith('/crash/')) {
+    let u; try { u = new URL(req.url, 'http://x'); } catch { res.writeHead(400); res.end(); return; }
+    handleCrashView(req, res, u); return;
+  }
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, queue: queue.length, rooms: rooms.size }));
