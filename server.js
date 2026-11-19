@@ -14,53 +14,37 @@
  *   PORT                      listen port (default 8080)
  *   REQUIRE_AUTH=1            reject clients without a valid Firebase ID token
  *   FIREBASE_SERVICE_ACCOUNT  path to a service-account JSON (for token checks)
+ *   CRASH_DIR                 where crash logs from the game are stored
+ *                             (default ./crash_logs)
+ *   TRUST_PROXY=1             use X-Forwarded-For for rate limiting (behind a proxy)
+ *
+ * Besides the duel relay this server has POST /crash: the game uploads its
+ * flight-recorder log there after a crash. One JSON file per upload is written
+ * to CRASH_DIR (nothing else is ever read back from it over HTTP).
  */
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT || 8080);
 const REQUIRE_AUTH = process.env.REQUIRE_AUTH === '1';
 const COUNTDOWN_MS = 3000;
-const ROOM_WAIT_MS = Number(process.env.ROOM_WAIT_MS || 120000);
+const ROOM_WAIT_MS = 120000;
 
-// ---- Firebase token verification --------------------------------------------
-// Key can come from (1) FIREBASE_SERVICE_ACCOUNT_JSON: the whole JSON text in an
-// environment variable, or (2) FIREBASE_SERVICE_ACCOUNT: path to the JSON file.
+// ---- optional Firebase token verification ---------------------------------
 let adminAuth = null;
-{
-  const fs = require('fs');
-  const path = require('path');
-  const jsonEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  const saPath = process.env.FIREBASE_SERVICE_ACCOUNT;
-  let cred = null;
-  try {
-    if (jsonEnv) {
-      cred = JSON.parse(jsonEnv);
-      console.log('Firebase key: read from FIREBASE_SERVICE_ACCOUNT_JSON');
-    } else if (saPath) {
-      const tries = [saPath, path.join('/etc/secrets', path.basename(saPath)),
-                     path.join(process.cwd(), path.basename(saPath))];
-      const found = tries.find((f) => fs.existsSync(f));
-      if (!found) {
-        let listing = '';
-        try { listing = ' /etc/secrets contains: [' + fs.readdirSync('/etc/secrets').join(', ') + ']'; }
-        catch { listing = ' (/etc/secrets does not exist: no Secret File was created)'; }
-        throw new Error('key file not found. Looked in: ' + tries.join(', ') + '.' + listing);
-      }
-      cred = JSON.parse(fs.readFileSync(found, 'utf8'));
-      console.log('Firebase key: read from ' + found);
-    } else if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      console.log('No Firebase key configured (set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT).');
-    }
-    if (cred || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-      const admin = require('firebase-admin');
-      admin.initializeApp(cred ? { credential: admin.credential.cert(cred) } : undefined);
-      adminAuth = admin.auth();
-    }
-  } catch (e) {
-    console.error('Firebase auth setup FAILED: ' + e.message);
+try {
+  const admin = require('firebase-admin');
+  const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (sa) {
+    admin.initializeApp({ credential: admin.credential.cert(require(require('path').resolve(sa))) });
+    adminAuth = admin.auth();
+  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    admin.initializeApp();
+    adminAuth = admin.auth();
   }
-}
+} catch (_) { /* firebase-admin not installed: dev mode */ }
 
 if (REQUIRE_AUTH && !adminAuth) {
   console.error('REQUIRE_AUTH=1 but firebase-admin is not configured. Exiting.');
@@ -80,6 +64,82 @@ function roomCode() {
   return c;
 }
 
+// ---- crash log intake ---------------------------------------------------------
+const CRASH_DIR = path.resolve(process.env.CRASH_DIR || path.join(__dirname, 'crash_logs'));
+const CRASH_MAX_BODY = 700 * 1024;     // bytes per upload
+const CRASH_MAX_LINES = 4000;
+const CRASH_MAX_LINE = 2000;
+const CRASH_MAX_FILES = 1000;          // oldest are deleted beyond this
+const CRASH_PER_IP_HOUR = 30;
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+const crashHits = new Map();           // ip -> [timestamps]
+
+try { fs.mkdirSync(CRASH_DIR, { recursive: true }); } catch (e) { console.error('crash dir:', e.message); }
+
+function crashAllowed(ip) {
+  const now = Date.now();
+  const hits = (crashHits.get(ip) || []).filter((t) => now - t < 3600e3);
+  if (hits.length >= CRASH_PER_IP_HOUR) { crashHits.set(ip, hits); return false; }
+  hits.push(now);
+  crashHits.set(ip, hits);
+  return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, hits] of crashHits) if (!hits.some((t) => now - t < 3600e3)) crashHits.delete(ip);
+}, 600e3).unref();
+
+function pruneCrashDir() {
+  try {
+    const files = fs.readdirSync(CRASH_DIR).filter((f) => f.endsWith('.json')).sort();
+    for (let i = 0; i < files.length - CRASH_MAX_FILES; i++) fs.unlinkSync(path.join(CRASH_DIR, files[i]));
+  } catch (_) { /* best effort */ }
+}
+
+function handleCrash(req, res) {
+  const reply = (code, body) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+  const fwd = TRUST_PROXY ? String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() : '';
+  const ip = fwd || req.socket.remoteAddress || 'unknown';
+  if (!crashAllowed(ip)) return reply(429, { ok: false });
+
+  let size = 0;
+  const chunks = [];
+  let aborted = false;
+  req.on('data', (c) => {
+    if (aborted) return;
+    size += c.length;
+    if (size > CRASH_MAX_BODY) { aborted = true; reply(413, { ok: false }); req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('error', () => {});
+  req.on('end', () => {
+    if (aborted) return;
+    let m;
+    try { m = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return reply(400, { ok: false }); }
+    if (!m || !Array.isArray(m.lines)) return reply(400, { ok: false });
+    const lines = m.lines.slice(-CRASH_MAX_LINES).map((l) => String(l).slice(0, CRASH_MAX_LINE));
+    const rec = {
+      receivedAt: new Date().toISOString(),
+      ip,
+      kind: clean(m.kind, 32) || 'unknown',
+      app: clean(m.app, 32),
+      install: clean(m.install, 32),
+      uploaderSession: clean(m.uploaderSession, 32),
+      platform: clean(m.platform, 16),
+      os: clean(m.os, 160),
+      cpus: num(m.cpus, 0, 256),
+      lines,
+    };
+    const name = `${Date.now()}_${rec.install.replace(/[^A-Za-z0-9]/g, '') || 'anon'}_${rec.kind.replace(/[^A-Za-z0-9-]/g, '')}.json`;
+    fs.writeFile(path.join(CRASH_DIR, name), JSON.stringify(rec, null, 1), (err) => {
+      if (err) return reply(500, { ok: false });
+      pruneCrashDir();
+      console.log(`crash log stored: ${name} (${lines.length} lines)`);
+      reply(200, { ok: true });
+    });
+  });
+}
+
 // ---- state -------------------------------------------------------------------
 const queue = [];            // sockets waiting for a random opponent
 const rooms = new Map();     // code -> Room
@@ -91,10 +151,7 @@ class Room {
     this.players = [];       // sockets, index = slot
     this.state = 'wait';     // wait | count | live | done
     this.timers = [];
-    // Only while waiting for the guest. Cleared in begin(), otherwise it would
-    // kill a live friend match 2 minutes after the room was created.
-    this.waitTimer = isPrivate ? setTimeout(() => { if (this.state === 'wait') this.destroy('expired'); }, ROOM_WAIT_MS) : null;
-    if (this.waitTimer) this.timers.push(this.waitTimer);
+    if (isPrivate) this.timers.push(setTimeout(() => this.destroy('expired'), ROOM_WAIT_MS));
   }
   add(ws) {
     this.players.push(ws);
@@ -102,7 +159,6 @@ class Room {
     ws.slot = this.players.length - 1;
   }
   begin() {
-    if (this.waitTimer) { clearTimeout(this.waitTimer); this.waitTimer = null; }
     this.state = 'count';
     this.players.forEach((p, i) => {
       const o = this.players[1 - i];
@@ -119,8 +175,7 @@ class Room {
   end(winner, reason) {
     if (this.state === 'done') return;
     this.state = 'done';
-    // `won` is explicit so a phone never has to work out its own result.
-    this.players.forEach((p, i) => send(p, { t: 'end', winner, reason, won: i === winner }));
+    this.players.forEach((p) => send(p, { t: 'end', winner, reason }));
     this.destroy(null);
   }
   destroy(notify) {
@@ -243,6 +298,7 @@ async function onMessage(ws, raw) {
 
 // ---- boot ----------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/crash') { handleCrash(req, res); return; }
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, queue: queue.length, rooms: rooms.size }));
